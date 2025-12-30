@@ -6,19 +6,58 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime, timezone
 import threading, os
+import pyodbc # Nuevo: Conector SQL Server
+import json
 
 app = Flask(__name__)
-# CORS amplio: sirve para pruebas; si deseas, ajusta orígenes
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 LOCK = threading.Lock()
 
-# ── rutas absolutas y carpeta data junto al app.py
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-EXCEL_PATH = DATA_DIR / "encuestas_satisfaccion.xlsx"
-SHEET = "respuestas"
+# ===================== CONFIGURACIÓN SQL SERVER =====================
+SQL_CONN_STR = (
+    "Driver={ODBC Driver 17 for SQL Server};"
+    "Server=DESKTOP-EO74OCH\\SQLEXPRESS;"
+    "Database=punta_medica;"
+    "Trusted_Connection=yes;"
+    "Encrypt=no;"
+    "TrustServerCertificate=yes;"
+)
+
+def get_db_connection():
+    return pyodbc.connect(SQL_CONN_STR)
+
+# ===================== INICIALIZACIÓN DE TABLA SQL =====================
+def init_db_satisfaccion():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Creamos una tabla que soporte el desglose por pregunta para facilitar estadísticas
+    cursor.execute('''
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='EncuestaSatisfaccionPacientes' AND xtype='U')
+        CREATE TABLE EncuestaSatisfaccionPacientes (
+            ID INT IDENTITY(1,1) PRIMARY KEY,
+            Encuesta_ID VARCHAR(50),
+            Pregunta_ID INT,
+            Pregunta_Texto VARCHAR(MAX),
+            Valor INT,
+            Sugerencia VARCHAR(MAX),
+            Nombre VARCHAR(255),
+            Contacto VARCHAR(255),
+            Fecha_Encuesta VARCHAR(100),
+            Created_At DATETIME DEFAULT GETDATE()
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db_satisfaccion()
+
+# --- CONFIGURACIÓN ORIGINAL EXCEL (COMENTADA) ---
+# BASE_DIR = Path(__file__).resolve().parent
+# DATA_DIR = BASE_DIR / "data"
+# DATA_DIR.mkdir(parents=True, exist_ok=True)
+# EXCEL_PATH = DATA_DIR / "encuestas_satisfaccion.xlsx"
+# SHEET = "respuestas"
 
 PREGUNTAS = {
     1: "La atención en Admisión fue rápida, eficiente y claras sus dudas.",
@@ -36,20 +75,9 @@ PREGUNTAS = {
     13: "Atención segura y de calidad.",
 }
 
-def _ensure_excel():
-    if not EXCEL_PATH.exists():
-        cols = ["encuesta_id","pregunta_id","pregunta","valor",
-                "sugerencia","nombre","contacto","fecha","created_at"]
-        with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl") as xw:
-            pd.DataFrame(columns=cols).to_excel(xw, index=False, sheet_name=SHEET)
-
-def _read_df():
-    _ensure_excel()
-    try:
-        return pd.read_excel(EXCEL_PATH, sheet_name=SHEET)
-    except Exception:
-        return pd.DataFrame(columns=["encuesta_id","pregunta_id","pregunta","valor",
-                                     "sugerencia","nombre","contacto","fecha","created_at"])
+# --- HELPERS ORIGINALES EXCEL (COMENTADOS) ---
+# def _ensure_excel(): ...
+# def _read_df(): ...
 
 # ──────────────────────────────
 # Errores siempre en JSON
@@ -58,27 +86,13 @@ def _read_df():
 def not_found(e): 
     return jsonify(ok=False, error="Ruta no encontrada", path=request.path), 404
 
-@app.errorhandler(405)
-def not_allowed(e): 
-    return jsonify(ok=False, error="Método no permitido", path=request.path), 405
-
 @app.errorhandler(Exception)
 def handle_exception(e):
     if isinstance(e, HTTPException):
         return jsonify(ok=False, error=e.description, code=e.code), e.code
     return jsonify(ok=False, error=str(e)), 500
 
-# ──────────────────────────────
-# Helpers de rutas (soportar con/sin /api)
-# ──────────────────────────────
 def dual_route(rule, **options):
-    """
-    Registra el mismo endpoint con y sin prefijo /api.
-    Ej: @dual_route('/encuesta-satisfaccion/ping')
-    crea:
-      /encuesta-satisfaccion/ping
-      /api/encuesta-satisfaccion/ping
-    """
     def decorator(f):
         app.add_url_rule(rule, endpoint=f.__name__ + rule, view_func=f, **options)
         api_rule = "/api" + (rule if rule.startswith("/") else "/" + rule)
@@ -92,11 +106,6 @@ def dual_route(rule, **options):
 @dual_route("/encuesta-satisfaccion/ping", methods=["GET"])
 def ping():
     return jsonify(ok=True, ts=datetime.now(timezone.utc).isoformat(), path=request.path)
-
-@dual_route("/encuesta-satisfaccion/routes", methods=["GET"])
-def routes():
-    rules = sorted([str(r) for r in app.url_map.iter_rules()])
-    return jsonify(ok=True, routes=rules)
 
 # ──────────────────────────────
 # Guardar encuesta
@@ -112,71 +121,75 @@ def guardar_encuesta():
     nombre = (payload.get("nombre") or "").strip()
     contacto = (payload.get("contacto") or "").strip()
     fecha = (payload.get("fecha") or "").strip()
-    created_at = datetime.now(timezone.utc).isoformat()
     encuesta_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
 
-    rows = []
-    for r in respuestas:
-        pid = int(r.get("pregunta_id", 0))
-        val = int(r.get("valor", 0))
-        if pid not in PREGUNTAS or val not in [1,2,3,4,5]:
-            return jsonify(ok=False, error=f"Entrada inválida (pregunta_id={pid}, valor={val})"), 400
-        rows.append({
-            "encuesta_id": encuesta_id,
-            "pregunta_id": pid,
-            "pregunta": PREGUNTAS[pid],
-            "valor": val,
-            "sugerencia": sugerencia,
-            "nombre": nombre,
-            "contacto": contacto,
-            "fecha": fecha,
-            "created_at": created_at
-        })
+    # --- LÓGICA SQL SERVER ---
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        for r in respuestas:
+            pid = int(r.get("pregunta_id", 0))
+            val = int(r.get("valor", 0))
+            if pid not in PREGUNTAS or val not in [1,2,3,4,5]:
+                return jsonify(ok=False, error=f"Entrada inválida (pid={pid}, val={val})"), 400
+            
+            cursor.execute("""
+                INSERT INTO EncuestaSatisfaccionPacientes 
+                (Encuesta_ID, Pregunta_ID, Pregunta_Texto, Valor, Sugerencia, Nombre, Contacto, Fecha_Encuesta)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (encuesta_id, pid, PREGUNTAS[pid], val, sugerencia, nombre, contacto, fecha))
+        
+        conn.commit()
+        conn.close()
 
-    df_new = pd.DataFrame(rows)
-    with LOCK:
-        _ensure_excel()
-        try:
-            df_old = pd.read_excel(EXCEL_PATH, sheet_name=SHEET)
-        except Exception:
-            df_old = pd.DataFrame(columns=df_new.columns)
-        df_out = pd.concat([df_old, df_new], ignore_index=True)
-        tmp = EXCEL_PATH.with_suffix(".tmp.xlsx")
-        with pd.ExcelWriter(tmp, engine="openpyxl") as xw:
-            df_out.to_excel(xw, index=False, sheet_name=SHEET)
-        tmp.replace(EXCEL_PATH)
+        # --- LÓGICA ORIGINAL EXCEL (COMENTADA) ---
+        # rows.append({...})
+        # with LOCK: ... (guardado en excel_path)
 
-    return jsonify(ok=True, encuesta_id=encuesta_id, guardadas=len(rows), path=request.path)
+        return jsonify(ok=True, encuesta_id=encuesta_id, guardadas=len(respuestas), path=request.path)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 # ──────────────────────────────
 # Stats
 # ──────────────────────────────
 @dual_route("/encuesta-satisfaccion/stats", methods=["GET"])
 def stats():
-    df = _read_df()
+    # --- NUEVA LÓGICA SQL SERVER ---
+    conn = get_db_connection()
+    df = pd.read_sql("SELECT * FROM EncuestaSatisfaccionPacientes", conn)
+    conn.close()
+
+    # --- LÓGICA ORIGINAL EXCEL (REEMPLAZADA POR DF DE SQL) ---
+    # df = _read_df()
+
     if df.empty:
         return jsonify(ok=True, total_respuestas=0, promedios={}, distribuciones={}, sugerencias=[], path=request.path)
 
-    total_encuestas = df["encuesta_id"].nunique()
+    total_encuestas = df["Encuesta_ID"].nunique()
 
-    prom = (df.groupby("pregunta_id")["valor"].mean().round(2)).to_dict()
-    dist = (df.groupby(["pregunta_id","valor"]).size().reset_index(name="conteo"))
+    # Adaptación de nombres de columnas de SQL para mantener la lógica de pandas
+    prom = (df.groupby("Pregunta_ID")["Valor"].mean().round(2)).to_dict()
+    dist = (df.groupby(["Pregunta_ID","Valor"]).size().reset_index(name="conteo"))
+    
     out_dist = {}
     for pid in sorted(PREGUNTAS.keys()):
-        sub = dist[dist["pregunta_id"] == pid]
-        m = {v: int(sub[sub["valor"]==v]["conteo"].sum()) for v in [1,2,3,4,5]}
+        sub = dist[dist["Pregunta_ID"] == pid]
+        m = {v: int(sub[sub["Valor"]==v]["conteo"].sum()) for v in [1,2,3,4,5]}
         out_dist[str(pid)] = m
 
-    sug = (df[df["sugerencia"].astype(str).str.strip() != ""]
-             .drop_duplicates(subset=["encuesta_id","sugerencia","created_at"])
-             .sort_values("created_at", ascending=False)
-             .head(100)[["sugerencia","nombre","contacto","fecha","created_at"]])
+    sug = (df[df["Sugerencia"].astype(str).str.strip() != ""]
+             .drop_duplicates(subset=["Encuesta_ID","Sugerencia","Created_At"])
+             .sort_values("Created_At", ascending=False)
+             .head(100))
+    
     sugerencias = [{
-        "texto": r["sugerencia"],
-        "nombre": r.get("nombre", ""),
-        "contacto": r.get("contacto", ""),
-        "fecha": r.get("fecha", ""),
-        "created_at": r.get("created_at", "")
+        "texto": r["Sugerencia"],
+        "nombre": r.get("Nombre", ""),
+        "contacto": r.get("Contacto", ""),
+        "fecha": r.get("Fecha_Encuesta", ""),
+        "created_at": r.get("Created_At").isoformat() if hasattr(r.get("Created_At"), 'isoformat') else str(r.get("Created_At"))
     } for _, r in sug.iterrows()]
 
     return jsonify(
@@ -189,19 +202,17 @@ def stats():
     )
 
 # ──────────────────────────────
-# Descargar Excel
+# Descargar Excel (Ahora generado desde SQL)
 # ──────────────────────────────
 @dual_route("/encuesta-satisfaccion/excel", methods=["GET"])
 def export_excel():
-    _ensure_excel()
-    return send_file(EXCEL_PATH, as_attachment=True, download_name="encuestas_satisfaccion.xlsx")
-
-def _print_routes():
-    print("=== RUTAS FLASK ===")
-    for r in sorted(app.url_map.iter_rules(), key=lambda x: str(x)):
-        print(f"{list(r.methods)} -> {r}")
+    conn = get_db_connection()
+    df = pd.read_sql("SELECT * FROM EncuestaSatisfaccionPacientes", conn)
+    conn.close()
+    
+    output_path = "export_satisfaccion.xlsx"
+    df.to_excel(output_path, index=False)
+    return send_file(output_path, as_attachment=True, download_name="encuestas_satisfaccion.xlsx")
 
 if __name__ == "__main__":
-    _print_routes()
-    # sin reloader para evitar instancias duplicadas
     app.run(host="0.0.0.0", port=6020, debug=True, use_reloader=False)
